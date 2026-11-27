@@ -1,0 +1,79 @@
+# Builds the French APK: Java/resources from this repository (translated launcher), native
+# libraries and assets from the official FF7Recomp release of the same version, signed with
+# tools/fr/ff7fr.jks (or the KEYSTORE_B64 / KEYSTORE_PASS secrets when they are set).
+name: APK français
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: android-actions/setup-android@v3
+
+      - name: SDK Android 35
+        run: sdkmanager "platforms;android-35" "build-tools;35.0.0"
+
+      - name: Version
+        id: v
+        run: echo "version=$(grep -oP "versionName '\K[^']+" android/app/build.gradle)" >> "$GITHUB_OUTPUT"
+
+      - name: APK officiel de la même version
+        env:
+          GH_TOKEN: ${{ github.token }}
+          V: ${{ steps.v.outputs.version }}
+        run: |
+          mkdir -p official
+          TAG=$(gh api "repos/bhuiyah/ff7-recomp-android/releases?per_page=100" --jq ".[] | select(.tag_name==\"v$V\" or .tag_name==\"$V\") | .tag_name" | head -1)
+          if [ -z "$TAG" ]; then echo "::error::Pas de version officielle $V sur bhuiyah/ff7-recomp-android"; exit 1; fi
+          gh release download "$TAG" -R bhuiyah/ff7-recomp-android -p '*.apk' -D official
+          ls -la official
+
+      - name: Compilation de la partie Java (traduite)
+        working-directory: android
+        run: |
+          chmod +x gradlew
+          ./gradlew --no-daemon assembleRelease -PjavaOnly
+
+      - name: Fusion, alignement, signature
+        env:
+          V: ${{ steps.v.outputs.version }}
+          KEYSTORE_B64: ${{ secrets.KEYSTORE_B64 }}
+          KEYSTORE_PASS: ${{ secrets.KEYSTORE_PASS }}
+        run: |
+          BT="$ANDROID_HOME/build-tools/35.0.0"
+          KS=tools/fr/ff7fr.jks; PASS=ff7recomp-fr
+          if [ -n "$KEYSTORE_B64" ]; then echo "$KEYSTORE_B64" | base64 -d > secret.jks; KS=secret.jks; PASS="$KEYSTORE_PASS"; fi
+          python3 tools/fr/merge_apk.py android/app/build/outputs/apk/release/app-release-unsigned.apk official/*.apk merged.apk
+          "$BT/zipalign" -P 16 -f 4 merged.apk aligned.apk
+          "$BT/apksigner" sign --ks "$KS" --ks-pass "pass:$PASS" --key-pass "pass:$PASS" --out "FF7Recomp-FR-$V.apk" aligned.apk
+          "$BT/apksigner" verify --print-certs "FF7Recomp-FR-$V.apk"
+          ls -la "FF7Recomp-FR-$V.apk"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: FF7Recomp-FR-${{ steps.v.outputs.version }}
+          path: FF7Recomp-FR-*.apk
+
+      - name: Publication (Releases)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          V: ${{ steps.v.outputs.version }}
+        run: |
+          gh release delete "v$V-fr" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag || true
+          gh release create "v$V-fr" "FF7Recomp-FR-$V.apk" --repo "$GITHUB_REPOSITORY" \
+            --title "FF7Recomp $V (français)" \
+            --notes "Lanceur FF7Recomp $V entièrement traduit en français. Bibliothèques natives et ressources : version officielle $V de bhuiyah/ff7-recomp-android. Signé avec une clé différente de l'APK officiel : désinstallez l'officiel avant d'installer celui-ci (sauvegardez d'abord vos sauvegardes avec Exporter les sauvegardes)."
